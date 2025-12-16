@@ -645,13 +645,13 @@ void BPF_STRUCT_OPS(deadline_wheel_enqueue, struct task_struct *p, u64 enq_flags
 	scx_arena_subprog_init();
 	bpf_printk("[INFO] [ENQUEUE] Enqueueing task %d (%s).\n", p->pid, p->comm);
 	//Check for any idle CPUs this task can run on
-	// s32 idle_cpu;
-	// if (!(enq_flags & SCX_ENQ_REENQ) && !(enq_flags & SCX_ENQ_CPU_SELECTED) && (idle_cpu = find_idle_cpu(p, scx_bpf_task_cpu(p))) >= 0) {
-	// 	bpf_printk("[INFO] [ENQUEUE] Enqueued task %d (%s) directly in cpu %d local dsq.\n", p->pid, p->comm, idle_cpu);
-	// 	scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | idle_cpu, SCX_SLICE_INF, enq_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT);
-	// 	scx_bpf_kick_cpu(idle_cpu, SCX_KICK_PREEMPT);
-	// 	return;
-	// }
+	s32 idle_cpu;
+	if (!(enq_flags & SCX_ENQ_REENQ) && !(enq_flags & SCX_ENQ_CPU_SELECTED) && (idle_cpu = find_idle_cpu(p, scx_bpf_task_cpu(p))) >= 0) {
+		bpf_printk("[INFO] [ENQUEUE] Enqueued task %d (%s) directly in cpu %d local dsq.\n", p->pid, p->comm, idle_cpu);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | idle_cpu, SCX_SLICE_INF, enq_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT);
+		scx_bpf_kick_cpu(idle_cpu, SCX_KICK_PREEMPT);
+		return;
+	}
 
 	// Check if there's a sched_ext task dispatched to a CPU, which has a later absolute deadline
 	s32 lower_priority_cpu = find_lower_priority_cpu(p);
@@ -916,7 +916,7 @@ void BPF_STRUCT_OPS(deadline_wheel_cpu_release, s32 cpu, struct scx_cpu_release_
 {
 	u64 now = scx_bpf_now();
 	bool is_kthread = (args->task->flags & PF_KTHREAD);
-	if (true)
+	if (!is_kthread)
 	{
 		int num_tasks_reenqueued = scx_bpf_reenqueue_local();
 		bpf_printk("[DEBUG] [RELEASE] Reenqued %d tasks from CPU %d's local DSQ\n", 
@@ -1213,7 +1213,7 @@ int BPF_PROG(handle_sched_switch, bool preempt, struct task_struct *prev, struct
 		cpu, prev_comm, prev_pid, prev_prio, prev_state, next_comm, next_pid, next_prio);
 	return 0;
 }
-
+/*
 struct sched_migrate_task_args {
     unsigned short common_type;
     unsigned char common_flags;
@@ -1242,7 +1242,7 @@ int sched_migrate_task_handler(struct sched_migrate_task_args *ctx)
                ctx->dest_cpu);
 
     return 0;
-}
+}*/
 
 // SEC("raw_tp/sched_wakeup")
 // int BPF_PROG(handle_sched_wakeup, struct task_struct *p)
