@@ -1,193 +1,123 @@
 // fib_sched_ext.cpp
-// Compile: g++ -std=c++17 fib_sched_ext.cpp -o fib_sched_ext -lpthread
-// Run: sudo ./fib_sched_ext 200
+// Compile: g++ -std=c++20 sample_scx_deadline_task_mt.cpp -o sample_scx_deadline_task_mt -lpthread -lbpf
+// Run: sudo ./sample_scx_deadline_task_mt 100000 4
 
 #include <iostream>
-#include <algorithm>
-#include <string>
 #include <vector>
+#include <string>
+#include <algorithm>
+#include <thread>
+#include <mutex>
+#include <barrier> // C++20
 #include <cstring>
 #include <sched.h>
 #include <unistd.h>
-#include <errno.h>
-#include <thread>
-#include <mutex>
+#include <bpf/bpf.h>
+#include <bpf/libbpf.h>
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <dirent.h>
-#include <ctype.h>
-
-#include "scx_deadline_helpers.h"
-
-// -------------------------------
-// Attempt to set scheduling class
-// -------------------------------
-int try_set_sched_ext(int pid) {
 #ifndef SCHED_EXT
-#define SCHED_EXT 7  // Fallback value (used by recent Linux kernels)
+#define SCHED_EXT 7
 #endif
 
-    struct sched_param sp;
-    sp.sched_priority = 0;
+#define MAP_PIN_PATH "/sys/fs/bpf/task_relative_deadlines_map"
 
-    if (sched_setscheduler(pid, SCHED_EXT, &sp) == -1) {
-        std::cerr << "Warning: Failed to set SCHED_EXT scheduling for pid: "
-                  << strerror(errno) << "\n";
-        std::cerr << "This usually means the kernel doesn’t support SCHED_EXT "
-                     "or privileges are insufficient.\n";
-        return -1;
-    }
+struct task_rel_dl {
+    struct bpf_spin_lock lock;
+    uint64_t rel_deadline;
+};
 
-    std::cout << "Successfully set scheduling policy to SCHED_EXT.\n";
-    return 0;
-}
-
-// ----------------------------------
-// Big integer addition using strings
-// ----------------------------------
-std::string add_big(const std::string& a, const std::string& b) {
-    std::string result;
-    int carry = 0;
-
-    int i = (int)a.size() - 1;
-    int j = (int)b.size() - 1;
-
-    while (i >= 0 || j >= 0 || carry) {
-        int da = (i >= 0 ? a[i--] - '0' : 0);
-        int db = (j >= 0 ? b[j--] - '0' : 0);
-        int sum = da + db + carry;
-        carry = sum / 10;
-        result.push_back((sum % 10) + '0');
-    }
-
-    std::reverse(result.begin(), result.end());
-    return result;
-}
-// Global mutex to prevent console output interleaving
 std::mutex cout_mutex;
-// --------------------------------
-// Compute nth Fibonacci as a string
-// --------------------------------
-std::string fibonacci_str(unsigned int n, int thread_num) {
-    if (n == 0) return "0";
-    if (n == 1 || n == 2) return "1";
-    int tid = gettid();
 
-    std::string a = "1";
-    std::string b = "1";
+// Optimized Addition
+void add_to(std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+    int carry = 0;
+    size_t n = a.size(), m = b.size();
+    for (size_t i = 0; i < std::max(n, m) || carry; ++i) {
+        if (i == a.size()) a.push_back(0);
+        int sum = a[i] + (i < m ? b[i] : 0) + carry;
+        a[i] = sum % 10;
+        carry = sum / 10;
+    }
+}
+
+std::string fibonacci_fast(unsigned int n) {
+    if (n == 0) return "0";
+    if (n <= 2) return "1";
+    size_t reserve_size = static_cast<size_t>(n * 0.21) + 2;
+    std::vector<uint8_t> a = {1}, b = {1};
+    a.reserve(reserve_size); b.reserve(reserve_size);
 
     for (unsigned int i = 3; i <= n; ++i) {
-        //if (i % 1000)
-            //std::cout << "@" << i << std::endl;
-        std::string c = add_big(a, b);
-        a = b;
-        b = c;
-
-/*
-        if (i%10000000)
-        {
-            std::lock_guard<std::mutex> lock(cout_mutex);
-            std::cout << "[Thread " << thread_num << "(" << tid << ")" << "] running" << std::endl;
-        }   
-*/
-
+        std::vector<uint8_t> next = a;
+        add_to(next, b);
+        a = std::move(b);
+        b = std::move(next);
     }
-
-    return b;
+    std::string res; res.reserve(b.size());
+    for (auto it = b.rbegin(); it != b.rend(); ++it) res += (*it + '0');
+    return res;
 }
 
-void fib_thread(unsigned int n, int thread_num) {
-    std::string fib = fibonacci_str(n,thread_num);
+void set_rel_deadline(int map_fd, int tid, uint64_t rel_dl) {
+    if (map_fd < 0) return;
+    struct task_rel_dl dl_struct = {};
+    dl_struct.rel_deadline = rel_dl;
+    bpf_map_update_elem(map_fd, &tid, &dl_struct, BPF_ANY | BPF_F_LOCK);
+}
+
+// Thread function now takes a reference to the barrier
+void fib_thread(unsigned int n, int id, uint64_t rel_dl, int map_fd, std::barrier<>& sync_point) {
+    pid_t tid = gettid();
+
+    // --- THE BARRIER ---
+    // Wait here until main thread and all other workers arrive
+    sync_point.arrive_and_wait();
+
+    // Now all threads proceed at once
+    set_rel_deadline(map_fd, tid, rel_dl);
+
+    struct sched_param sp = { .sched_priority = 0 };
+    if (sched_setscheduler(0, SCHED_EXT, &sp) == -1) {
+        std::lock_guard<std::mutex> lock(cout_mutex);
+        std::cerr << "[Thread " << id << "] SCHED_EXT failed: " << strerror(errno) << "\n";
+    }
+
+    std::string result = fibonacci_fast(n);
+
     std::lock_guard<std::mutex> lock(cout_mutex);
-    std::cout << "[Thread " << thread_num << "] Done\n";
-    std::cout << "[Thread " << thread_num << "] F_" << n << " = " << fib << "\n";
-    std::cout << "[Thread " << thread_num << "] Number of digits: " << fib.size() << "\n";
+    std::cout << "[Thread " << id << "] TID: " << tid << " | Digits: " << result.size() << " | Done.\n";
 }
 
-// Checks if a string consists only of digits
-int is_digits(const char *str) {
-    for (; *str; ++str)
-        if (!isdigit((unsigned char)*str)) return 0;
-    return 1;
-}
-
-std::vector<int> get_tids(pid_t pid)
-{
-    std::vector<int> tids;
-    char path[128];
-    snprintf(path, sizeof(path), "/proc/%d/task", pid);
-
-    DIR *dir = opendir(path);
-    if (!dir) {
-        perror("opendir");
-        return tids;
-    }
-
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        // Skip . and ..
-        if (entry->d_name[0] == '.')
-            continue;
-        if (is_digits(entry->d_name)) {
-            int tid = atoi(entry->d_name);
-            tids.push_back(tid);
-        }
-    }
-
-    closedir(dir);
-    return tids;
-}
-
-// -------------
-// Entry point
-// -------------
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
+    if (argc < 3) {
         std::cerr << "Usage: " << argv[0] << " <n> <num_threads>\n";
         return 1;
     }
 
     unsigned int n = std::stoul(argv[1]);
     unsigned int num_threads = std::stoul(argv[2]);
+    
+    int map_fd = bpf_obj_get(MAP_PIN_PATH);
+    if (map_fd < 0) perror("Warning: BPF map not found");
+
+    // Initialize barrier for worker threads + 1 (main thread)
+    std::barrier sync_point(num_threads + 1);
 
     std::vector<std::thread> threads;
-    for (int i = 0; i < num_threads; ++i) {
-        threads.emplace_back(fib_thread, n, i+1);
+    uint64_t current_dl = 1e7;
+
+    for (unsigned int i = 0; i < num_threads; ++i) {
+        threads.emplace_back(fib_thread, n, i + 1, current_dl, map_fd, std::ref(sync_point));
+        current_dl *= 2;
     }
 
-    pid_t pid = getpid();
-    std::vector<int> tids = get_tids(pid);
-    std::cout << "TIDs for PID " << pid << ": ";
-    for (const auto& tid : tids)
-    {
-        std::cout << tid << ", ";
-        
-    }
-    std::cout << std::endl;
-
-    uint64_t rel_dl = 1e7;
-    uint64_t rel_dl_set;
+    std::cout << "[Main] All threads spawned. Releasing barrier...\n";
     
-    for (int i = 0; i < tids.size(); i++)
-    {
-        if (i==0) continue;
-        int tid = tids.at(i);
-        set_rel_deadline(tid, rel_dl);
-        rel_dl_set= get_rel_deadline(tid);
-        std::cout << "Set releative deadline for " << tid << " to " << rel_dl_set << std::endl;
-        rel_dl *= 2;
-    }
-
-    for (int i = 1; i < tids.size(); i++)
-    {
-        int tid = tids.at(i);
-        try_set_sched_ext(tid);
-        std::cout << "Set " << tid << " to SCHED_EXT" << std::endl;
-    }
+    // Main thread arrives at the barrier to release everyone
+    sync_point.arrive_and_wait();
 
     for (auto& t : threads) t.join();
+    if (map_fd >= 0) close(map_fd);
 
     return 0;
 }
-
