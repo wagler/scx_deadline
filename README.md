@@ -7,8 +7,8 @@ This repository provides an implementation of the Earliest Deadline First schedu
 ## Quick start
 ### Build scheduler
 ```
-git clone https://github.com/wagler/scx-tracer.git
-cd scx-tracer
+git clone https://github.com/wagler/scx_deadline.git
+cd scx_deadline
 ```
 
 You need to copy the contents of `tools/sched_ext` into your Linux kernel source path's tools/`sched_ext directory`. For example, if your Linux kernel source is in `~/kernel`, then run:
